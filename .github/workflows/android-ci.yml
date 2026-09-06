@@ -1,0 +1,163 @@
+name: Android CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load pinned toolchain
+        run: |
+          set -euo pipefail
+          test -f toolchain.env
+          grep -vE '^\s*#|^\s*$' toolchain.env >> "$GITHUB_ENV"
+          cat toolchain.env
+
+      - name: Verify toolchain has not drifted
+        run: bash .github/scripts/verify-toolchain.sh
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build-tools
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Apply CI Gradle properties
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cp .github/ci-gradle.properties "$HOME/.gradle/gradle.properties"
+
+      - name: Capture toolchain report
+        run: |
+          set -euo pipefail
+          mkdir -p ci-out/toolchain ci-out/logs
+          {
+            echo "Ahmed Reaction Studio toolchain"
+            echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "github_sha=${GITHUB_SHA}"
+            echo "github_ref=${GITHUB_REF}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_run_number=${GITHUB_RUN_NUMBER}"
+            echo
+            echo "=== pinned toolchain.env ==="
+            cat toolchain.env
+            echo
+            echo "=== java ==="
+            java -version 2>&1
+            echo "JAVA_HOME=${JAVA_HOME:-}"
+            echo
+            echo "=== gradle wrapper ==="
+            ./gradlew --version
+            echo
+            echo "=== android sdk ==="
+            echo "ANDROID_HOME=${ANDROID_HOME:-}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+            command -v sdkmanager && sdkmanager --list_installed || true
+            echo
+            echo "=== os ==="
+            uname -a
+            lsb_release -a 2>/dev/null || true
+          } | tee ci-out/toolchain/toolchain-report.txt
+
+      - name: Build debug APK
+        id: build
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug :app:lintDebug \
+            --stacktrace --full-stacktrace --warning-mode all --console=plain \
+            | tee ci-out/logs/gradle-assembleDebug.log
+
+      - name: Collect APK, reports, and logs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p ci-out/apk ci-out/reports ci-out/logs
+          if [[ -f app/build/outputs/apk/debug/app-debug.apk ]]; then
+            cp app/build/outputs/apk/debug/app-debug.apk \
+              "ci-out/apk/AhmedReactionStudio-${GITHUB_SHA:0:12}-debug.apk"
+            cp app/build/outputs/apk/debug/app-debug.apk ci-out/apk/app-debug.apk
+            ls -lh ci-out/apk
+          else
+            echo "APK was not produced" | tee ci-out/logs/apk-missing.txt
+          fi
+          if [[ -d app/build/outputs/apk ]]; then
+            cp -R app/build/outputs/apk ci-out/apk/outputs || true
+          fi
+          if [[ -d app/build/reports ]]; then
+            cp -R app/build/reports/. ci-out/reports/ || true
+          fi
+          if [[ -d app/build/outputs/lint-results-debug ]]; then
+            cp -R app/build/outputs/lint-results-debug ci-out/reports/ || true
+          fi
+          find app/build -name 'lint-results*' -o -name '*.html' -o -name '*.xml' \
+            | head -n 50 >> ci-out/logs/report-index.txt || true
+          {
+            echo "## Android CI"
+            echo
+            echo "- SHA: \`${GITHUB_SHA}\`"
+            echo "- Ref: \`${GITHUB_REF}\`"
+            echo "- Java: ${JAVA_VERSION} (${JAVA_DISTRIBUTION})"
+            echo "- Gradle: ${GRADLE_VERSION}"
+            echo "- AGP: ${AGP_VERSION} / Kotlin ${KOTLIN_VERSION}"
+            echo "- compileSdk ${COMPILE_SDK}, minSdk ${MIN_SDK}, targetSdk ${TARGET_SDK}"
+            echo "- Build tools: ${BUILD_TOOLS}"
+            if [[ -f ci-out/apk/app-debug.apk ]]; then
+              echo "- APK: \`ci-out/apk/AhmedReactionStudio-${GITHUB_SHA:0:12}-debug.apk\` (\`$(wc -c < ci-out/apk/app-debug.apk)\` bytes)"
+            else
+              echo "- APK: **missing**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if the APK is missing
+        if: always()
+        run: |
+          if [[ ! -f ci-out/apk/app-debug.apk ]]; then
+            echo "error: debug APK was not generated — inspect ci-out/logs" >&2
+            exit 1
+          fi
+
+      - name: Upload APK, logs, and toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AhmedReactionStudio-${{ github.run_number }}-${{ github.sha }}
+          path: ci-out/
+          if-no-files-found: error
+          retention-days: 30

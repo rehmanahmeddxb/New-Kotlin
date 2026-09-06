@@ -78,11 +78,28 @@ Implemented:
 
 Open in Android Studio, let Gradle sync, then run the `app` configuration.
 
-The project uses:
+Pinned toolchain (`toolchain.env`):
 
 - Android Gradle Plugin 8.7.3
 - Kotlin Android plugin 2.0.21
+- Gradle 8.11.1
+- JDK 17
 - compileSdk 35
 - minSdk 26
 - targetSdk 35
 - Framework APIs only (no AndroidX)
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+## CI
+
+Every push and pull request runs `.github/workflows/android-ci.yml`:
+
+- Verifies `toolchain.env` still matches Gradle files (version drift fails the job)
+- Validates the Gradle wrapper
+- Builds a debug APK and runs Android Lint
+- Uploads the APK, Gradle logs, lint reports, and a toolchain dump as a single artifact
+
+Logs and the APK are uploaded even when the build fails, so compile errors are not lost.
