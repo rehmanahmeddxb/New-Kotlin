@@ -1,28 +1,61 @@
 package com.rehman.ahmedreactionstudio.editor
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.graphics.*
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
-import android.view.*
+import android.view.TextureView
+import android.view.View
 import android.widget.*
+import com.rehman.ahmedreactionstudio.capture.CameraEngine
+import com.rehman.ahmedreactionstudio.capture.CaptureHub
+import com.rehman.ahmedreactionstudio.capture.MicRecorder
+import com.rehman.ahmedreactionstudio.capture.ScreenCaptureService
+import com.rehman.ahmedreactionstudio.export.ExportPipeline
+import com.rehman.ahmedreactionstudio.media.MediaImport
 import com.rehman.ahmedreactionstudio.model.*
+import com.rehman.ahmedreactionstudio.playback.PreviewController
 import com.rehman.ahmedreactionstudio.ui.DiagnosticsActivity
 import com.rehman.ahmedreactionstudio.ui.Ui
 import com.rehman.ahmedreactionstudio.ui.toast
-import kotlin.math.max
-import kotlin.math.min
+import java.io.File
+import kotlin.concurrent.thread
 
 class EditorActivity : Activity() {
     private lateinit var store: ProjectStore
     private lateinit var project: Project
     private lateinit var stage: StageView
     private lateinit var panelHost: LinearLayout
+    private lateinit var playBtn: Button
+    private lateinit var recordBtn: Button
+    private lateinit var timeLabel: TextView
+    private lateinit var camera: CameraEngine
+    private lateinit var preview: PreviewController
+    private val mic = MicRecorder()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var selectedId: String? = null
     private var activePanel: Panel = Panel.SOURCES
+    private var pendingType: LayerType? = null
+    private var pendingReplaceId: String? = null
+    private var pendingGrant: (() -> Unit)? = null
+    private var pendingScreen: (() -> Unit)? = null
+    private var recording = false
+    private var exporting = false
+    private var recordStartedAt = 0L
+    private var cameraLayerId: String? = null
+    private var cameraCaptureFile: File? = null
+    private var micLayerId: String? = null
+    private var screenLayerId: String? = null
 
     enum class Panel(val title: String) { SOURCES("Sources"), MIXER("Mixer"), PROPERTIES("Properties"), EFFECTS("Effects"), EXPORT("Export") }
 
@@ -34,7 +67,27 @@ class EditorActivity : Activity() {
         if (project.layers.isEmpty()) seedStarterSources()
         selectedId = savedInstanceState?.getString("selected") ?: project.layers.firstOrNull()?.id
         activePanel = Panel.valueOf(savedInstanceState?.getString("panel") ?: Panel.SOURCES.name)
+        camera = CameraEngine(this)
+        preview = PreviewController(this).also { engine ->
+            engine.onTime = { pos, dur ->
+                if (!recording && ::timeLabel.isInitialized) {
+                    timeLabel.setTextColor(Ui.FG)
+                    timeLabel.text = "${fmt(pos)} / ${fmt(dur)}"
+                }
+            }
+            engine.onState = { playing ->
+                if (::playBtn.isInitialized) playBtn.text = if (playing) "❚❚ Pause" else "▶ Play"
+            }
+        }
+        CaptureHub.onScreenStopped = { path, ok ->
+            if (ok) attachCapture(screenLayerId, path, "video/mp4")
+            screenLayerId = null
+            recording = false
+            finishTake(ok)
+        }
+        CaptureHub.onScreenError = { toast(it) }
         buildUi()
+        preview.rebuild(project)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -44,20 +97,39 @@ class EditorActivity : Activity() {
     }
 
     override fun onPause() {
-        super.onPause()
+        preview.pause()
+        if (!recording) runCatching { camera.stopPreview() }
         save()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::stage.isInitialized) stage.sync()
+        reattachSurfaces()
+        preview.applyMixer(project)
+    }
+
+    override fun onDestroy() {
+        CaptureHub.onScreenStopped = null
+        CaptureHub.onScreenError = null
+        preview.release()
+        mic.stop()
+        camera.release()
+        if (::stage.isInitialized) stage.release()
+        super.onDestroy()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        runCatching { camera.stopPreview() }
         buildUi()
+        preview.rebuild(project)
+        reattachSurfaces()
     }
 
     private fun seedStarterSources() {
-        project.layers += Layer(type = LayerType.VIDEO, name = "Local Video")
         project.layers += Layer(type = LayerType.CAMERA, name = "Camera", x = .76f, y = .28f, scale = .28f)
-        project.layers += Layer(type = LayerType.AUDIO_MUSIC, name = "Background Music", muted = true, volume = .45f)
-        project.layers += Layer(type = LayerType.AUDIO_MIC, name = "External Mic", muted = true, volume = .80f)
         save()
     }
 
@@ -67,11 +139,34 @@ class EditorActivity : Activity() {
             setBackgroundColor(Ui.BG)
         }
         root.addView(topBar(), LinearLayout.LayoutParams(-1, Ui.dp(this, 56)))
-
         val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         if (isLandscape) buildLandscape(root) else buildPortrait(root)
         setContentView(root)
         refreshPanel()
+        updateTransport()
+    }
+
+    private fun attachStage(): StageView = StageView(this).also { view ->
+        view.onTextureReady = ::onTextureReady
+        view.bind(project, selectedId, ::select)
+    }
+
+    private fun onTextureReady(id: String, tv: TextureView) {
+        val texture = tv.surfaceTexture ?: return
+        val layer = project.layer(id) ?: return
+        val liveId = project.layers.firstOrNull { it.isLiveCamera() }?.id
+        when {
+            layer.isLiveCamera() && layer.id == liveId -> camera.startPreview(texture, layer.cameraFront)
+            PreviewController.playsOnTexture(layer) -> preview.attachSurface(id, texture)
+        }
+    }
+
+    private fun reattachSurfaces() {
+        if (!::stage.isInitialized) return
+        project.layers.forEach { layer ->
+            val tv = stage.texture(layer.id) ?: return@forEach
+            if (tv.isAvailable) onTextureReady(layer.id, tv)
+        }
     }
 
     private fun topBar(): View {
@@ -99,7 +194,7 @@ class EditorActivity : Activity() {
     }
 
     private fun buildPortrait(root: LinearLayout) {
-        stage = StageView(this).also { it.bind(project) { select(it) } }
+        stage = attachStage()
         root.addView(stage, LinearLayout.LayoutParams(-1, 0, 1f))
         panelHost = Ui.col(this).apply {
             setPadding(Ui.dp(this@EditorActivity, 12), Ui.dp(this@EditorActivity, 8), Ui.dp(this@EditorActivity, 12), Ui.dp(this@EditorActivity, 8))
@@ -113,7 +208,7 @@ class EditorActivity : Activity() {
         val body = Ui.row(this)
         root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
         body.addView(toolRail(), LinearLayout.LayoutParams(Ui.dp(this, 92), -1))
-        stage = StageView(this).also { it.bind(project) { select(it) } }
+        stage = attachStage()
         body.addView(stage, LinearLayout.LayoutParams(0, -1, 1f))
         panelHost = Ui.col(this).apply {
             setPadding(Ui.dp(this@EditorActivity, 12), Ui.dp(this@EditorActivity, 8), Ui.dp(this@EditorActivity, 12), Ui.dp(this@EditorActivity, 8))
@@ -137,13 +232,17 @@ class EditorActivity : Activity() {
     private fun transportBar(): LinearLayout = Ui.row(this).apply {
         setPadding(Ui.dp(this@EditorActivity, 10), Ui.dp(this@EditorActivity, 7), Ui.dp(this@EditorActivity, 10), Ui.dp(this@EditorActivity, 7))
         setBackgroundColor(0xff0d0f14.toInt())
-        addView(Ui.button(this@EditorActivity, "▶ Play").apply { setOnClickListener { toast("Preview playback placeholder") } }, LinearLayout.LayoutParams(-2, -1).apply { marginEnd = Ui.dp(this@EditorActivity, 8) })
-        addView(Ui.button(this@EditorActivity, "● Record", 0xff692020.toInt()).apply { setOnClickListener { toast("Recording engine hook ready; media capture is next milestone") } }, LinearLayout.LayoutParams(-2, -1).apply { marginEnd = Ui.dp(this@EditorActivity, 8) })
-        addView(Ui.label(this@EditorActivity, "00:00 / 00:00", 13f, Ui.FG), LinearLayout.LayoutParams(0, -2, 1f))
+        playBtn = Ui.button(this@EditorActivity, "▶ Play").apply { setOnClickListener { togglePlay() } }
+        recordBtn = Ui.button(this@EditorActivity, "● Record", 0xff692020.toInt()).apply { setOnClickListener { toggleRecord() } }
+        timeLabel = Ui.label(this@EditorActivity, "00:00 / 00:00", 13f, Ui.FG)
+        addView(playBtn, LinearLayout.LayoutParams(-2, -1).apply { marginEnd = Ui.dp(this@EditorActivity, 8) })
+        addView(recordBtn, LinearLayout.LayoutParams(-2, -1).apply { marginEnd = Ui.dp(this@EditorActivity, 8) })
+        addView(timeLabel, LinearLayout.LayoutParams(0, -2, 1f))
         addView(Ui.button(this@EditorActivity, "Save", Ui.ACCENT).apply { setOnClickListener { save(); toast("Project saved") } }, LinearLayout.LayoutParams(-2, -1))
     }
 
     private fun refreshPanel() {
+        if (!::panelHost.isInitialized) return
         panelHost.removeAllViews()
         if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) panelHost.addView(tabRow())
         panelHost.addView(Ui.title(this, activePanel.title, 16f).apply { setPadding(0, 0, 0, Ui.dp(this@EditorActivity, 8)) })
@@ -158,7 +257,10 @@ class EditorActivity : Activity() {
             Panel.EFFECTS -> buildEffects(inner)
             Panel.EXPORT -> buildExport(inner)
         }
-        stage.invalidate()
+        if (::stage.isInitialized) {
+            stage.setSelected(selectedId)
+            stage.invalidate()
+        }
     }
 
     private fun tabRow(): LinearLayout = Ui.row(this).apply {
@@ -173,6 +275,7 @@ class EditorActivity : Activity() {
     private fun buildSources(container: LinearLayout) {
         sourceButton(container, "Camera", LayerType.CAMERA)
         sourceButton(container, "Local Video", LayerType.VIDEO)
+        sourceButton(container, "Screen Recording", LayerType.SCREEN)
         sourceButton(container, "Image", LayerType.IMAGE)
         sourceButton(container, "Text", LayerType.TEXT)
         sourceButton(container, "Background Music", LayerType.AUDIO_MUSIC)
@@ -192,7 +295,15 @@ class EditorActivity : Activity() {
             isClickable = true
             setOnClickListener { select(layer.id) }
         }
-        row.addView(Ui.label(this, "${layer.type.icon} ${layer.name}", 13f, if (layer.id == selectedId) Ui.ACCENT else Ui.FG), LinearLayout.LayoutParams(0, -2, 1f))
+        val status = when {
+            layer.hasMedia() -> "media"
+            layer.isLiveCamera() -> "live"
+            layer.type == LayerType.SCREEN -> "ready"
+            layer.type == LayerType.AUDIO_MIC -> "live"
+            layer.type == LayerType.TEXT -> "text"
+            else -> "empty"
+        }
+        row.addView(Ui.label(this, "${layer.type.icon} ${layer.name}  · $status", 13f, if (layer.id == selectedId) Ui.ACCENT else Ui.FG), LinearLayout.LayoutParams(0, -2, 1f))
         row.addView(Ui.chip(this, if (layer.visible) "Show" else "Hide").apply { setOnClickListener { layer.visible = !layer.visible; changed() } }, LinearLayout.LayoutParams(-2, Ui.dp(this, 32)).apply { marginEnd = Ui.dp(this@EditorActivity, 4) })
         row.addView(Ui.chip(this, "⋮").apply { setOnClickListener { layerMenu(layer) } }, LinearLayout.LayoutParams(-2, Ui.dp(this, 32)))
         container.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = Ui.dp(this@EditorActivity, 6) })
@@ -219,7 +330,14 @@ class EditorActivity : Activity() {
                 max = 100
                 progress = (layer.volume * 100).toInt()
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) { if (fromUser) { layer.volume = progress / 100f; percent.text = "Volume $progress%"; save() } }
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (fromUser) {
+                            layer.volume = progress / 100f
+                            percent.text = "Volume $progress%"
+                            preview.applyMixer(project)
+                            save()
+                        }
+                    }
                     override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
                     override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
                 })
@@ -238,6 +356,37 @@ class EditorActivity : Activity() {
         }
         container.addView(Ui.label(this, "Selected: ${layer.name}", 14f, Ui.FG))
         container.addView(Ui.button(this, "Rename").apply { setOnClickListener { rename(layer) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
+        when (layer.type) {
+            LayerType.VIDEO, LayerType.IMAGE, LayerType.AUDIO_MUSIC -> {
+                val label = if (layer.hasMedia()) "Replace media" else "Attach media"
+                val mime = if (layer.type == LayerType.IMAGE) "image/*" else if (layer.type == LayerType.AUDIO_MUSIC) "audio/*" else "video/*"
+                container.addView(Ui.button(this, label).apply { setOnClickListener { pick(layer.type, mime, layer.id) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+            }
+            LayerType.SCREEN -> {
+                container.addView(Ui.button(this, if (layer.hasMedia()) "Replace with video file" else "Import screen video").apply {
+                    setOnClickListener { pick(LayerType.SCREEN, "video/*", layer.id) }
+                }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+                if (layer.hasMedia()) container.addView(Ui.button(this, "Clear recording").apply {
+                    setOnClickListener { layer.clearMedia(); changed(media = true) }
+                }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+            }
+            LayerType.CAMERA -> {
+                if (layer.hasMedia()) {
+                    container.addView(Ui.button(this, "Clear take (return to live)").apply {
+                        setOnClickListener { layer.clearMedia(); changed(media = true) }
+                    }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+                } else {
+                    container.addView(Ui.button(this, if (layer.cameraFront) "Use back camera" else "Use front camera").apply {
+                        setOnClickListener {
+                            layer.cameraFront = !layer.cameraFront
+                            stage.texture(layer.id)?.surfaceTexture?.let { camera.startPreview(it, layer.cameraFront) }
+                            changed()
+                        }
+                    }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+                }
+            }
+            else -> Unit
+        }
         container.addView(Ui.button(this, if (layer.locked) "Unlock" else "Lock").apply { setOnClickListener { layer.locked = !layer.locked; changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
         container.addView(Ui.button(this, "Fit Center").apply { setOnClickListener { layer.x = .5f; layer.y = .5f; layer.scale = if (layer.type == LayerType.CAMERA) .32f else 1f; changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
         slider(container, "Scale", (layer.scale * 100).toInt(), 20, 200) { layer.scale = it / 100f; changed(false) }
@@ -251,14 +400,19 @@ class EditorActivity : Activity() {
         if (layer == null || !layer.type.visual) return
         container.addView(Ui.button(this, "Reset rotation").apply { setOnClickListener { layer.rotation = 0f; changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
         container.addView(Ui.button(this, "Rotate 90°").apply { setOnClickListener { layer.rotation = (layer.rotation + 90f) % 360f; changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
-        container.addView(Ui.button(this, "Bring to front").apply { setOnClickListener { project.layers.remove(layer); project.layers.add(layer); changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
-        container.addView(Ui.button(this, "Send to back").apply { setOnClickListener { project.layers.remove(layer); project.layers.add(0, layer); changed() } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+        container.addView(Ui.button(this, "Bring to front").apply { setOnClickListener { project.layers.remove(layer); project.layers.add(layer); changed(media = true) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
+        container.addView(Ui.button(this, "Send to back").apply { setOnClickListener { project.layers.remove(layer); project.layers.add(0, layer); changed(media = true) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 42)).apply { topMargin = Ui.dp(this@EditorActivity, 6) })
     }
 
     private fun buildExport(container: LinearLayout) {
-        container.addView(Ui.label(this, "Export path is intentionally explicit in this rebuilt project: preview/export engine is the next native milestone, not hidden behind broken decompiled methods.", 13f, Ui.FG2))
-        container.addView(Ui.button(this, "Validate project").apply { setOnClickListener { toast("${project.layers.size} sources ready. ${project.layers.count { it.isMixable() }} audio channels.") } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 10) })
-        container.addView(Ui.button(this, "Save project", Ui.ACCENT).apply { setOnClickListener { save(); toast("Project saved") } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
+        val duration = project.exportDurationMs()
+        val visuals = project.layers.count { it.visible && it.type.visual }
+        val audio = project.layers.count { it.isMixable() && (it.hasMedia() || it.type == LayerType.AUDIO_MIC || it.type == LayerType.CAMERA) }
+        container.addView(Ui.label(this, "Renders the canvas to H.264/AAC MP4 and publishes it to Movies/AhmedReactionStudio.\n\n$visuals visual layers · $audio audio channels · ${fmt(duration)} timeline", 13f, Ui.FG2))
+        container.addView(Ui.button(this, "Validate project").apply { setOnClickListener { toast(validateMessage()) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 10) })
+        container.addView(Ui.button(this, "Export 720p").apply { setOnClickListener { startExport(720) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
+        container.addView(Ui.button(this, "Export 1080p", Ui.ACCENT).apply { setOnClickListener { startExport(1080) } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
+        container.addView(Ui.button(this, "Save project").apply { setOnClickListener { save(); toast("Project saved") } }, LinearLayout.LayoutParams(-1, Ui.dp(this, 44)).apply { topMargin = Ui.dp(this@EditorActivity, 8) })
     }
 
     private fun slider(container: LinearLayout, label: String, value: Int, minValue: Int, maxValue: Int, onChange: (Int) -> Unit) {
@@ -280,21 +434,44 @@ class EditorActivity : Activity() {
     }
 
     private fun addLayer(type: LayerType) {
+        when (type) {
+            LayerType.VIDEO -> pick(type, "video/*")
+            LayerType.IMAGE -> pick(type, "image/*")
+            LayerType.AUDIO_MUSIC -> pick(type, "audio/*")
+            LayerType.CAMERA -> ensurePerms(listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) { insertLayer(type) }
+            LayerType.AUDIO_MIC -> ensurePerms(listOf(Manifest.permission.RECORD_AUDIO)) { insertLayer(type) }
+            LayerType.SCREEN, LayerType.TEXT -> insertLayer(type)
+        }
+    }
+
+    private fun insertLayer(type: LayerType) {
         val layer = Layer(type = type, name = type.label)
         if (type == LayerType.CAMERA) { layer.x = .76f; layer.y = .28f; layer.scale = .28f }
         if (!type.visual && type.hasAudio) layer.visible = false
         project.layers += layer
         selectedId = layer.id
-        changed()
+        changed(media = true)
         toast("${type.label} added")
+    }
+
+    private fun pick(type: LayerType, mime: String, replaceId: String? = null) {
+        pendingType = type
+        pendingReplaceId = replaceId
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            this.type = mime
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        startActivityForResult(intent, REQ_PICK)
     }
 
     private fun layerMenu(layer: Layer) {
         AlertDialog.Builder(this).setTitle(layer.name).setItems(arrayOf("Properties", "Duplicate", "Delete")) { _, which ->
             when (which) {
                 0 -> { selectedId = layer.id; activePanel = Panel.PROPERTIES; refreshPanel() }
-                1 -> { project.layers += layer.copy(id = java.util.UUID.randomUUID().toString(), name = "${layer.name} copy"); changed() }
-                2 -> { project.layers.remove(layer); selectedId = project.layers.firstOrNull()?.id; changed() }
+                1 -> { project.layers += layer.copy(id = java.util.UUID.randomUUID().toString(), name = "${layer.name} copy"); changed(media = true) }
+                2 -> { project.layers.remove(layer); selectedId = project.layers.firstOrNull()?.id; changed(media = true) }
             }
         }.show()
     }
@@ -306,11 +483,11 @@ class EditorActivity : Activity() {
 
     private fun editText(layer: Layer) {
         val input = EditText(this).apply { setText(layer.text); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE; minLines = 3 }
-        AlertDialog.Builder(this).setTitle("Edit text").setView(input).setPositiveButton("Save") { _, _ -> layer.text = input.text.toString(); changed() }.setNegativeButton("Cancel", null).show()
+        AlertDialog.Builder(this).setTitle("Edit text").setView(input).setPositiveButton("Save") { _, _ -> layer.text = input.text.toString(); changed(media = true) }.setNegativeButton("Cancel", null).show()
     }
 
     private fun chooseAspect() {
-        AlertDialog.Builder(this).setTitle("Canvas aspect ratio").setItems(Aspect.entries.map { it.label }.toTypedArray()) { _, which -> project.aspect = Aspect.entries[which]; changed() }.show()
+        AlertDialog.Builder(this).setTitle("Canvas aspect ratio").setItems(Aspect.entries.map { it.label }.toTypedArray()) { _, which -> project.aspect = Aspect.entries[which]; changed(media = true) }.show()
     }
 
     private fun openSettings() {
@@ -328,105 +505,339 @@ class EditorActivity : Activity() {
         AlertDialog.Builder(this).setTitle("Rename project").setView(input).setPositiveButton("Save") { _, _ -> project.name = input.text.toString().ifBlank { "Untitled Project" }; changed() }.setNegativeButton("Cancel", null).show()
     }
 
-    private fun select(id: String?) { selectedId = id; refreshPanel() }
-    private fun changed(refresh: Boolean = true) { save(); if (refresh) refreshPanel() else stage.invalidate() }
-    private fun save() = store.save(project)
-
-    companion object { const val EXTRA_PROJECT_ID = "pid" }
-}
-
-class StageView(context: android.content.Context) : View(context) {
-    private var project: Project? = null
-    private var onSelect: ((String?) -> Unit)? = null
-    private var dragging: Layer? = null
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER; textSize = 38f; typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD) }
-
-    fun bind(project: Project, onSelect: (String?) -> Unit) {
-        this.project = project
-        this.onSelect = onSelect
+    private fun togglePlay() {
+        if (recording) {
+            preview.toggle()
+            return
+        }
+        if (project.playableDurationMs() <= 0L) {
+            toast("Import a video/audio clip or record a take first")
+            return
+        }
+        preview.toggle()
+        updateTransport()
     }
 
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        canvas.drawColor(0xff050608.toInt())
-        val p = project ?: return
-        val frame = canvasRect(p.aspect)
-        paint.color = 0xff202431.toInt(); canvas.drawRoundRect(frame, 20f, 20f, paint)
-        paint.style = Paint.Style.STROKE; paint.color = 0x44ffffff; paint.strokeWidth = 2f; canvas.drawRoundRect(frame, 20f, 20f, paint); paint.style = Paint.Style.FILL
-        p.layers.filter { it.visible && it.type.visual }.forEach { drawLayer(canvas, frame, it) }
-        if (p.layers.none { it.visible && it.type.visual }) {
-            textPaint.color = 0xffaab2c2.toInt(); textPaint.textSize = 34f
-            canvas.drawText("Add a visual source", frame.centerX(), frame.centerY(), textPaint)
+    private fun toggleRecord() {
+        if (recording || CaptureHub.screenRecording) {
+            stopRecording()
+            return
+        }
+        val needsCamera = project.layers.any { it.isLiveCamera() }
+        val needsScreen = project.layers.any { it.type == LayerType.SCREEN && !it.hasMedia() }
+        val needsMic = project.layers.any { it.type == LayerType.AUDIO_MIC && !it.muted }
+        if (!needsCamera && !needsScreen && !needsMic) {
+            toast("Add a live camera, screen or mic source to record")
+            return
+        }
+        val required = mutableListOf<String>()
+        if (needsCamera) required += Manifest.permission.CAMERA
+        if (needsCamera || needsMic || needsScreen) required += Manifest.permission.RECORD_AUDIO
+        if (Build.VERSION.SDK_INT >= 33 && needsScreen) required += Manifest.permission.POST_NOTIFICATIONS
+        ensurePerms(required) {
+            if (needsScreen) requestScreen { beginCapture(needsCamera, needsScreen, needsMic) }
+            else beginCapture(needsCamera, needsScreen, needsMic)
         }
     }
 
-    private fun drawLayer(canvas: Canvas, frame: RectF, layer: Layer) {
-        val w = frame.width() * layer.scale
-        val h = frame.height() * layer.scale * .56f
-        val cx = frame.left + frame.width() * layer.x
-        val cy = frame.top + frame.height() * layer.y
-        val rect = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-        canvas.save()
-        canvas.rotate(layer.rotation, cx, cy)
-        paint.color = when (layer.type) {
-            LayerType.CAMERA -> 0xff284878.toInt()
-            LayerType.VIDEO, LayerType.SCREEN -> 0xff303848.toInt()
-            LayerType.IMAGE -> 0xff404050.toInt()
-            LayerType.TEXT -> Color.TRANSPARENT
-            else -> Color.TRANSPARENT
+    private fun beginCapture(needsCamera: Boolean, needsScreen: Boolean, needsMic: Boolean) {
+        val dedicatedMic = needsMic
+        val cameraAudio = needsCamera && !dedicatedMic
+        val screenAudio = needsScreen && !dedicatedMic && !cameraAudio
+        val dir = store.captureDir(project.id)
+        recording = true
+        recordStartedAt = SystemClock.elapsedRealtime()
+        var started = false
+        if (needsCamera) {
+            val layer = project.layers.first { it.isLiveCamera() }
+            val file = File(dir, "camera_${System.currentTimeMillis()}.mp4")
+            if (!camera.ready) {
+                toast("Camera is still starting")
+            } else if (camera.startRecord(file, cameraAudio)) {
+                cameraLayerId = layer.id
+                cameraCaptureFile = file
+                started = true
+            } else toast("Could not record camera")
         }
-        paint.alpha = (layer.opacity * 255).toInt().coerceIn(0, 255)
-        if (layer.type != LayerType.TEXT) canvas.drawRoundRect(rect, 18f, 18f, paint)
-        textPaint.color = if (layer.type == LayerType.TEXT) layer.color else Color.WHITE
-        textPaint.alpha = paint.alpha
-        textPaint.textSize = max(20f, min(42f, rect.width() / 8f))
-        canvas.drawText(if (layer.type == LayerType.TEXT) layer.text.ifBlank { layer.name } else "${layer.type.icon} ${layer.name}", rect.centerX(), rect.centerY(), textPaint)
-        paint.alpha = 255
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 3f; paint.color = if (layer.locked) Ui.WARN else 0x66ffffff; canvas.drawRoundRect(rect, 18f, 18f, paint); paint.style = Paint.Style.FILL
-        canvas.restore()
-    }
-
-    private fun canvasRect(aspect: Aspect): RectF {
-        val pad = 28f
-        val availableW = width - pad * 2
-        val availableH = height - pad * 2
-        val ratio = aspect.width.toFloat() / aspect.height
-        var w = availableW
-        var h = w / ratio
-        if (h > availableH) { h = availableH; w = h * ratio }
-        val l = (width - w) / 2f
-        val t = (height - h) / 2f
-        return RectF(l, t, l + w, t + h)
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        val p = project ?: return false
-        val frame = canvasRect(p.aspect)
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                dragging = p.layers.asReversed().firstOrNull { it.visible && it.type.visual && !it.locked && hit(frame, it, event.x, event.y) }
-                onSelect?.invoke(dragging?.id)
-                return true
+        if (needsMic) {
+            val layer = project.layers.first { it.type == LayerType.AUDIO_MIC && !it.muted }
+            val file = File(dir, "mic_${System.currentTimeMillis()}.m4a")
+            if (mic.start(this, file)) {
+                micLayerId = layer.id
+                started = true
+            } else toast("Could not record mic")
+        }
+        if (needsScreen) {
+            val layer = project.layers.first { it.type == LayerType.SCREEN && !it.hasMedia() }
+            val file = File(dir, "screen_${System.currentTimeMillis()}.mp4")
+            val data = screenData
+            val code = screenCode
+            if (data == null || code == 0) {
+                toast("Screen permission missing")
+            } else {
+                screenLayerId = layer.id
+                ScreenCaptureService.start(this, code, data, file, screenAudio)
+                screenData = null
+                screenCode = 0
+                started = true
+                toast("Screen recording started. Switch to the app you want to capture, then return and press Stop.")
             }
-            MotionEvent.ACTION_MOVE -> {
-                dragging?.let {
-                    it.x = ((event.x - frame.left) / frame.width()).coerceIn(0f, 1f)
-                    it.y = ((event.y - frame.top) / frame.height()).coerceIn(0f, 1f)
-                    invalidate()
+        }
+        if (!started) {
+            recording = false
+            return
+        }
+        if (project.playableDurationMs() > 0L) preview.play()
+        updateTransport()
+        mainHandler.post(recTick)
+        if (needsScreen.not()) toast("Recording")
+    }
+
+    private fun stopRecording() {
+        recording = false
+        mainHandler.removeCallbacks(recTick)
+        preview.pause()
+        cameraCaptureFile?.let { file ->
+            camera.stopRecord()
+            attachCapture(cameraLayerId, file.absolutePath, "video/mp4")
+            cameraCaptureFile = null
+            cameraLayerId = null
+        }
+        mic.stop()?.let { file ->
+            attachCapture(micLayerId, file.absolutePath, "audio/mp4")
+            micLayerId = null
+        }
+        if (CaptureHub.screenRecording) {
+            ScreenCaptureService.stop(this)
+            toast("Stopping screen capture…")
+            updateTransport()
+            return
+        }
+        finishTake(true)
+    }
+
+    private fun finishTake(ok: Boolean = true) {
+        recording = false
+        mainHandler.removeCallbacks(recTick)
+        if (project.layers.any { it.type == LayerType.CAMERA && it.hasMedia() }) {
+            runCatching { camera.stopPreview() }
+        }
+        preview.rebuild(project)
+        if (::stage.isInitialized) stage.sync()
+        reattachSurfaces()
+        updateTransport()
+        save()
+        toast(if (ok) "Take saved" else "Capture stopped")
+    }
+
+    private fun attachCapture(layerId: String?, path: String, mime: String) {
+        val layer = project.layer(layerId) ?: return
+        val imported = MediaImport.attachFile(layer.id, project.id, File(path), this, mime) ?: return
+        layer.mediaPath = imported.path
+        layer.mimeType = imported.mime
+        layer.durationMs = imported.durationMs
+        layer.mediaWidth = imported.width
+        layer.mediaHeight = imported.height
+        if (layer.name == layer.type.label) layer.name = imported.displayName.ifBlank { layer.type.label }
+    }
+
+    private val recTick = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            if (::timeLabel.isInitialized) {
+                timeLabel.setTextColor(Ui.DANGER)
+                timeLabel.text = "REC ${fmt(SystemClock.elapsedRealtime() - recordStartedAt)}"
+            }
+            mainHandler.postDelayed(this, 200)
+        }
+    }
+
+    private fun updateTransport() {
+        if (!::playBtn.isInitialized) return
+        playBtn.text = if (preview.playing) "❚❚ Pause" else "▶ Play"
+        recordBtn.text = if (recording || CaptureHub.screenRecording) "■ Stop" else "● Record"
+        if (!recording) {
+            timeLabel.setTextColor(Ui.FG)
+            timeLabel.text = "${fmt(preview.positionMs)} / ${fmt(preview.durationMs)}"
+        }
+    }
+
+    private fun startExport(longEdge: Int) {
+        if (exporting) return
+        if (project.layers.none { it.visible && it.type.visual }) {
+            toast("Add a visible visual source before export")
+            return
+        }
+        if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            ensurePerms(listOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)) { startExport(longEdge) }
+            return
+        }
+        preview.pause()
+        val snap = if (::stage.isInitialized) stage.cameraBitmap() else null
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = false
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Exporting ${longEdge}p")
+            .setMessage("Compositing layers and publishing to MediaStore…")
+            .setView(bar)
+            .setCancelable(false)
+            .show()
+        exporting = true
+        thread {
+            val result = runCatching {
+                ExportPipeline(applicationContext).export(project, longEdge, snap) { progress ->
+                    runOnUiThread { bar.progress = (progress * 100).toInt().coerceIn(0, 100) }
                 }
-                return true
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { dragging = null; return true }
+            runOnUiThread {
+                exporting = false
+                dialog.dismiss()
+                result.fold(
+                    onSuccess = { exported ->
+                        AlertDialog.Builder(this)
+                            .setTitle("Export complete")
+                            .setMessage(exported.message)
+                            .setPositiveButton("Open") { _, _ ->
+                                val uri = exported.uri
+                                if (uri != null) {
+                                    runCatching {
+                                        startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                                    }.onFailure { toast("No app available to open the video") }
+                                } else toast("Saved to ${exported.file.absolutePath}")
+                            }
+                            .setNegativeButton("OK", null)
+                            .show()
+                    },
+                    onFailure = { toast(it.message ?: "Export failed") }
+                )
+            }
         }
-        return true
     }
 
-    private fun hit(frame: RectF, layer: Layer, x: Float, y: Float): Boolean {
-        val w = frame.width() * layer.scale
-        val h = frame.height() * layer.scale * .56f
-        val cx = frame.left + frame.width() * layer.x
-        val cy = frame.top + frame.height() * layer.y
-        return x in (cx - w / 2)..(cx + w / 2) && y in (cy - h / 2)..(cy + h / 2)
+    private fun validateMessage(): String {
+        val missing = project.layers.filter {
+            it.type in setOf(LayerType.VIDEO, LayerType.IMAGE, LayerType.AUDIO_MUSIC) && !it.hasMedia()
+        }
+        val live = project.layers.count { it.isLiveCamera() || it.type == LayerType.SCREEN && !it.hasMedia() || it.type == LayerType.AUDIO_MIC }
+        return buildString {
+            append("${project.layers.size} sources, ${project.layers.count { it.isMixable() }} audio channels, ${fmt(project.exportDurationMs())} export length.")
+            if (missing.isNotEmpty()) append(" Missing media: ${missing.joinToString { it.name }}.")
+            if (live > 0) append(" $live live source(s) will freeze or skip unless you record a take first.")
+            if (missing.isEmpty() && live == 0) append(" Ready to export.")
+        }
+    }
+
+    private fun ensurePerms(required: List<String>, then: () -> Unit) {
+        val missing = required.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) then()
+        else {
+            pendingGrant = then
+            requestPermissions(missing.toTypedArray(), REQ_PERMS)
+        }
+    }
+
+    private var screenCode = 0
+    private var screenData: Intent? = null
+
+    private fun requestScreen(then: () -> Unit) {
+        pendingScreen = then
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mgr.createScreenCaptureIntent(), REQ_SCREEN)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_PERMS) return
+        val requiredDenied = permissions.indices.any { i ->
+            grantResults.getOrNull(i) != PackageManager.PERMISSION_GRANTED && permissions[i] != Manifest.permission.POST_NOTIFICATIONS
+        }
+        val action = pendingGrant
+        pendingGrant = null
+        if (requiredDenied) toast("Permission required") else action?.invoke()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SCREEN) {
+            val next = pendingScreen
+            pendingScreen = null
+            if (resultCode == RESULT_OK && data != null) {
+                screenCode = resultCode
+                screenData = data
+                next?.invoke()
+            } else toast("Screen capture cancelled")
+            return
+        }
+        if (requestCode != REQ_PICK || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val type = pendingType ?: return
+        val replaceId = pendingReplaceId
+        pendingType = null
+        pendingReplaceId = null
+        toast("Importing…")
+        thread {
+            val existing = if (replaceId != null) project.layer(replaceId) else null
+            val target = existing ?: Layer(type = type, name = type.label).also { created ->
+                if (!type.visual && type.hasAudio) created.visible = false
+            }
+            val imported = MediaImport.copy(this, uri, project.id, target.id)
+            runOnUiThread {
+                if (imported == null) {
+                    toast("Could not import media")
+                    return@runOnUiThread
+                }
+                if (existing == null) {
+                    project.layers += target
+                    selectedId = target.id
+                }
+                target.mediaPath = imported.path
+                target.mediaUri = uri.toString()
+                target.mimeType = imported.mime
+                target.durationMs = imported.durationMs
+                target.mediaWidth = imported.width
+                target.mediaHeight = imported.height
+                if (target.name == target.type.label) target.name = imported.displayName.ifBlank { target.type.label }
+                changed(media = true)
+                toast("Imported ${target.name}")
+            }
+        }
+    }
+
+    private fun select(id: String?) {
+        selectedId = id
+        if (::stage.isInitialized) stage.setSelected(id)
+        refreshPanel()
+    }
+
+    private fun changed(refresh: Boolean = true, media: Boolean = false) {
+        save()
+        preview.applyMixer(project)
+        if (media) {
+            if (project.layers.none { it.isLiveCamera() }) runCatching { camera.stopPreview() }
+            preview.rebuild(project)
+            if (::stage.isInitialized) stage.sync()
+            reattachSurfaces()
+        } else if (::stage.isInitialized) {
+            stage.requestLayout()
+            stage.invalidate()
+        }
+        if (refresh) refreshPanel()
+        updateTransport()
+    }
+
+    private fun save() = store.save(project)
+    private fun fmt(ms: Long): String {
+        val total = (ms / 1000L).toInt().coerceAtLeast(0)
+        return "%02d:%02d".format(total / 60, total % 60)
+    }
+
+    companion object {
+        const val EXTRA_PROJECT_ID = "pid"
+        private const val REQ_PICK = 202
+        private const val REQ_SCREEN = 203
+        private const val REQ_PERMS = 204
     }
 }

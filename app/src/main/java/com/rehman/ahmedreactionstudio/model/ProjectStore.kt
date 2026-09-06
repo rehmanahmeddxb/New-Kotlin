@@ -23,5 +23,12 @@ class ProjectStore(private val context: Context) {
 
     fun delete(id: String) {
         File(root, "$id.json").delete()
+        File(context.filesDir, "media/$id").deleteRecursively()
+        File(context.filesDir, "captures/$id").deleteRecursively()
+        File(context.filesDir, "export/$id").deleteRecursively()
     }
+
+    fun mediaDir(projectId: String): File = File(context.filesDir, "media/$projectId").apply { mkdirs() }
+    fun captureDir(projectId: String): File = File(context.filesDir, "captures/$projectId").apply { mkdirs() }
+    fun exportDir(projectId: String): File = File(context.filesDir, "export/$projectId").apply { mkdirs() }
 }
