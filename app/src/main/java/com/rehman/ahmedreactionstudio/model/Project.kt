@@ -15,6 +15,10 @@ data class Project(
     fun layer(id: String?): Layer? = layers.firstOrNull { it.id == id }
     fun touch() { updatedAt = System.currentTimeMillis() }
 
+    fun playableDurationMs(): Long = layers.maxOfOrNull { it.durationMs }?.coerceAtLeast(0L) ?: 0L
+
+    fun exportDurationMs(): Long = playableDurationMs().coerceAtLeast(5_000L)
+
     fun toJson(): JSONObject {
         val arr = JSONArray()
         layers.forEach { arr.put(it.toJson()) }

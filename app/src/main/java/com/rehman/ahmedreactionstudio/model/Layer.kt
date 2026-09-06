@@ -1,6 +1,7 @@
 package com.rehman.ahmedreactionstudio.model
 
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 
 data class Layer(
@@ -18,10 +19,29 @@ data class Layer(
     var rotation: Float = 0f,
     var opacity: Float = 1f,
     var text: String = if (type == LayerType.TEXT) "Reaction text" else "",
-    var color: Int = -1
+    var color: Int = -1,
+    var mediaPath: String = "",
+    var mediaUri: String = "",
+    var mimeType: String = "",
+    var durationMs: Long = 0L,
+    var mediaWidth: Int = 0,
+    var mediaHeight: Int = 0,
+    var cameraFront: Boolean = true
 ) {
     fun isAudioOnly(): Boolean = !type.visual && type.hasAudio
     fun isMixable(): Boolean = type.hasAudio
+    fun hasMedia(): Boolean = mediaPath.isNotBlank() && File(mediaPath).exists()
+    fun isLiveCamera(): Boolean = type == LayerType.CAMERA && !hasMedia()
+    fun isCapturedVideo(): Boolean = type.visual && type != LayerType.IMAGE && type != LayerType.TEXT && hasMedia()
+
+    fun clearMedia() {
+        mediaPath = ""
+        mediaUri = ""
+        mimeType = ""
+        durationMs = 0L
+        mediaWidth = 0
+        mediaHeight = 0
+    }
 
     fun toJson(): JSONObject = JSONObject()
         .put("id", id)
@@ -39,6 +59,13 @@ data class Layer(
         .put("opacity", opacity.toDouble())
         .put("text", text)
         .put("color", color)
+        .put("mediaPath", mediaPath)
+        .put("mediaUri", mediaUri)
+        .put("mimeType", mimeType)
+        .put("durationMs", durationMs)
+        .put("mediaWidth", mediaWidth)
+        .put("mediaHeight", mediaHeight)
+        .put("cameraFront", cameraFront)
 
     companion object {
         fun fromJson(json: JSONObject): Layer = Layer(
@@ -56,7 +83,14 @@ data class Layer(
             rotation = json.optDouble("rotation", 0.0).toFloat(),
             opacity = json.optDouble("opacity", 1.0).toFloat(),
             text = json.optString("text", ""),
-            color = json.optInt("color", -1)
+            color = json.optInt("color", -1),
+            mediaPath = json.optString("mediaPath", ""),
+            mediaUri = json.optString("mediaUri", ""),
+            mimeType = json.optString("mimeType", ""),
+            durationMs = json.optLong("durationMs", 0L),
+            mediaWidth = json.optInt("mediaWidth", 0),
+            mediaHeight = json.optInt("mediaHeight", 0),
+            cameraFront = json.optBoolean("cameraFront", true)
         )
     }
 }

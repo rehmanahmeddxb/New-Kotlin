@@ -51,15 +51,28 @@ Implemented:
 - Mixer panel with mute/solo/volume
 - Properties panel
 - Effects panel with basic transforms
-- Export/validation placeholder
 - Diagnostics screen
+- SAF media picker that copies video, image and audio into app storage
+- Camera2 live PiP preview, flip, and take recording
+- MediaProjection foreground service for screen capture
+- External mic takes
+- Native MediaPlayer preview clock with mixer mute/solo/volume
+- H.264/AAC composition export at 720p or 1080p
+- MediaStore publishing to `Movies/AhmedReactionStudio`
 
-Next milestone:
+## Capture / export flow
 
-- Attach real media picker/import paths
-- Camera and screen capture services
-- Native preview playback and export pipeline
-- MediaStore publishing
+1. Import a main video (and optional image, text, music).
+2. Keep the camera PiP live, or add a screen/mic source.
+3. Press **Record** to capture live sources. Imported media plays during the take so you can react.
+4. Press **Play** to preview the composition with mixer levels.
+5. Export 720p or 1080p — layers are composited, audio is mixed, and the MP4 is published to the gallery.
+
+## Next milestone
+
+- GPU compositor for faster export
+- Timeline scrubber and keyframed transforms
+- Waveforms in the mixer
 
 ## Build
 
@@ -72,3 +85,4 @@ The project uses:
 - compileSdk 35
 - minSdk 26
 - targetSdk 35
+- Framework APIs only (no AndroidX)
